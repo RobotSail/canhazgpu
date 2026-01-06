@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -12,16 +15,63 @@ import (
 )
 
 type Client struct {
-	rdb *redis.Client
+	rdb      *redis.Client
+	hostname string
 }
 
 func NewClient(config *types.Config) *Client {
+	hostname := config.Hostname
+	if hostname == "" {
+		// Auto-detect hostname if not provided
+		var err error
+		hostname, err = getHostname()
+		if err != nil {
+			// Fallback to "localhost" for backward compatibility
+			hostname = "localhost"
+		}
+	}
+
 	rdb := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", config.RedisHost, config.RedisPort),
-		DB:   config.RedisDB,
+		Addr:     fmt.Sprintf("%s:%d", config.RedisHost, config.RedisPort),
+		Password: config.RedisPassword,
+		DB:       config.RedisDB,
 	})
 
-	return &Client{rdb: rdb}
+	return &Client{
+		rdb:      rdb,
+		hostname: hostname,
+	}
+}
+
+// getHostname returns the system hostname
+func getHostname() (string, error) {
+	// Try os.Hostname() first (most reliable)
+	hostname, err := os.Hostname()
+	if err == nil && hostname != "" {
+		return hostname, nil
+	}
+
+	// Fallback: try hostname command with -f flag for FQDN
+	cmd := exec.Command("hostname", "-f")
+	output, err := cmd.Output()
+	if err == nil {
+		hostname = strings.TrimSpace(string(output))
+		if hostname != "" {
+			return hostname, nil
+		}
+	}
+
+	// Last resort: try short hostname command
+	cmd = exec.Command("hostname")
+	output, err = cmd.Output()
+	if err == nil {
+		hostname = strings.TrimSpace(string(output))
+		if hostname != "" {
+			return hostname, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to detect hostname")
 }
 
 func (c *Client) Close() error {
@@ -35,11 +85,17 @@ func (c *Client) Ping(ctx context.Context) error {
 // GPU State Management
 
 func (c *Client) SetGPUCount(ctx context.Context, count int) error {
-	return c.rdb.Set(ctx, types.RedisKeyGPUCount, count, 0).Err()
+	key := types.NodeGPUCountKey(c.hostname)
+	// Also register this node in the nodes set
+	if err := c.rdb.SAdd(ctx, types.RedisKeyNodes, c.hostname).Err(); err != nil {
+		return fmt.Errorf("failed to register node: %v", err)
+	}
+	return c.rdb.Set(ctx, key, count, 0).Err()
 }
 
 func (c *Client) GetGPUCount(ctx context.Context) (int, error) {
-	val, err := c.rdb.Get(ctx, types.RedisKeyGPUCount).Int()
+	key := types.NodeGPUCountKey(c.hostname)
+	val, err := c.rdb.Get(ctx, key).Int()
 	if err == redis.Nil {
 		return 0, fmt.Errorf("GPU pool not initialized - run 'canhazgpu admin --gpus <count>' first")
 	}
@@ -47,11 +103,13 @@ func (c *Client) GetGPUCount(ctx context.Context) (int, error) {
 }
 
 func (c *Client) SetAvailableProvider(ctx context.Context, provider string) error {
-	return c.rdb.Set(ctx, types.RedisKeyProvider, provider, 0).Err()
+	key := types.NodeProviderKey(c.hostname)
+	return c.rdb.Set(ctx, key, provider, 0).Err()
 }
 
 func (c *Client) GetAvailableProvider(ctx context.Context) (string, error) {
-	val, err := c.rdb.Get(ctx, types.RedisKeyProvider).Result()
+	key := types.NodeProviderKey(c.hostname)
+	val, err := c.rdb.Get(ctx, key).Result()
 	if err == redis.Nil {
 		// Check if this is a pre-provider deployment by looking for existing GPU count
 		gpuCount, countErr := c.GetGPUCount(ctx)
@@ -73,7 +131,7 @@ func (c *Client) GetAvailableProvider(ctx context.Context) (string, error) {
 }
 
 func (c *Client) GetGPUState(ctx context.Context, gpuID int) (*types.GPUState, error) {
-	key := fmt.Sprintf("%sgpu:%d", types.RedisKeyPrefix, gpuID)
+	key := types.NodeGPUKey(c.hostname, gpuID)
 	val, err := c.rdb.Get(ctx, key).Result()
 	if err == redis.Nil {
 		// GPU is available
@@ -92,7 +150,7 @@ func (c *Client) GetGPUState(ctx context.Context, gpuID int) (*types.GPUState, e
 }
 
 func (c *Client) SetGPUState(ctx context.Context, gpuID int, state *types.GPUState) error {
-	key := fmt.Sprintf("%sgpu:%d", types.RedisKeyPrefix, gpuID)
+	key := types.NodeGPUKey(c.hostname, gpuID)
 
 	if state.User == "" {
 		// GPU is available, just store last_released timestamp if it exists
@@ -117,7 +175,7 @@ func (c *Client) SetGPUState(ctx context.Context, gpuID int, state *types.GPUSta
 }
 
 func (c *Client) DeleteGPUState(ctx context.Context, gpuID int) error {
-	key := fmt.Sprintf("%sgpu:%d", types.RedisKeyPrefix, gpuID)
+	key := types.NodeGPUKey(c.hostname, gpuID)
 	return c.rdb.Del(ctx, key).Err()
 }
 
@@ -163,6 +221,7 @@ func (c *Client) AtomicReserveGPUs(ctx context.Context, request *types.Allocatio
 		local expiry_time = ARGV[7]
 		local unreserved_gpus_json = ARGV[8]
 		local note = ARGV[9]
+		local hostname = ARGV[10]
 
 		-- Parse unreserved GPUs
 		local unreserved_gpus = {}
@@ -198,7 +257,7 @@ func (c *Client) AtomicReserveGPUs(ctx context.Context, request *types.Allocatio
 		-- Get available GPUs with MRU-per-user ranking
 		local available_gpus = {}
 		for i = 0, gpu_count - 1 do
-			local key = "canhazgpu:gpu:" .. i
+			local key = "canhazgpu:" .. hostname .. ":gpu:" .. i
 			local gpu_data = redis.call('GET', key)
 
 			-- Skip unreserved GPUs
@@ -301,7 +360,7 @@ func (c *Client) AtomicReserveGPUs(ctx context.Context, request *types.Allocatio
 			end
 
 			-- Set GPU state
-			local key = "canhazgpu:gpu:" .. gpu_id
+			local key = "canhazgpu:" .. hostname .. ":gpu:" .. gpu_id
 			redis.call('SET', key, cjson.encode(state))
 		end
 		
@@ -338,6 +397,7 @@ func (c *Client) AtomicReserveGPUs(ctx context.Context, request *types.Allocatio
 		expiryTime,
 		string(unreservedJSON),
 		request.Note,
+		c.hostname,
 	).Result()
 
 	if err != nil {
@@ -387,7 +447,8 @@ func (c *Client) atomicReserveSpecificGPUs(ctx context.Context, request *types.A
 		local unreserved_gpus_json = ARGV[7]
 		local gpu_count = tonumber(ARGV[8])
 		local note = ARGV[9]
-		
+		local hostname = ARGV[10]
+
 		-- Parse requested GPU IDs
 		local requested_gpus = {}
 		if requested_gpus_json and requested_gpus_json ~= "" and requested_gpus_json ~= "[]" and requested_gpus_json ~= "null" then
@@ -399,7 +460,7 @@ func (c *Client) atomicReserveSpecificGPUs(ctx context.Context, request *types.A
 		else
 			return redis.error_reply("No GPU IDs specified")
 		end
-		
+
 		-- Parse unreserved GPUs (GPUs in use without reservation)
 		local unreserved_gpus = {}
 		if unreserved_gpus_json and unreserved_gpus_json ~= "" and unreserved_gpus_json ~= "[]" and unreserved_gpus_json ~= "null" then
@@ -410,23 +471,23 @@ func (c *Client) atomicReserveSpecificGPUs(ctx context.Context, request *types.A
 				end
 			end
 		end
-		
+
 		-- Validate all requested GPUs
 		for _, gpu_id in ipairs(requested_gpus) do
 			local gpu_id_num = tonumber(gpu_id)
-			
+
 			-- Check if GPU ID is valid (within range)
 			if gpu_id_num < 0 or gpu_id_num >= gpu_count then
 				return redis.error_reply("GPU ID " .. gpu_id .. " is out of range (0-" .. (gpu_count-1) .. ")")
 			end
-			
+
 			-- Check if GPU is unreserved (in use without reservation)
 			if unreserved_gpus[gpu_id_num] then
 				return redis.error_reply("GPU " .. gpu_id .. " is in use without reservation")
 			end
-			
+
 			-- Check if GPU is already reserved
-			local key = "canhazgpu:gpu:" .. gpu_id
+			local key = "canhazgpu:" .. hostname .. ":gpu:" .. gpu_id
 			local gpu_data = redis.call('GET', key)
 			
 			if gpu_data then
@@ -471,7 +532,7 @@ func (c *Client) atomicReserveSpecificGPUs(ctx context.Context, request *types.A
 			end
 
 			-- Set GPU state
-			local key = "canhazgpu:gpu:" .. gpu_id
+			local key = "canhazgpu:" .. hostname .. ":gpu:" .. gpu_id
 			redis.call('SET', key, cjson.encode(state))
 		end
 		
@@ -514,6 +575,7 @@ func (c *Client) atomicReserveSpecificGPUs(ctx context.Context, request *types.A
 		string(unreservedJSON),
 		gpuCount,
 		request.Note,
+		c.hostname,
 	).Result()
 
 	if err != nil {
@@ -553,8 +615,9 @@ func (c *Client) atomicReserveSpecificGPUs(ctx context.Context, request *types.A
 
 // Clear all GPU states (for admin --force)
 func (c *Client) ClearAllGPUStates(ctx context.Context) error {
-	// Get all GPU keys
-	keys, err := c.rdb.Keys(ctx, types.RedisKeyPrefix+"gpu:*").Result()
+	// Get all GPU keys for this node
+	pattern := types.RedisKeyPrefix + c.hostname + ":gpu:*"
+	keys, err := c.rdb.Keys(ctx, pattern).Result()
 	if err != nil {
 		return err
 	}

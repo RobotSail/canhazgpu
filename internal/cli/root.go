@@ -34,6 +34,8 @@ func init() {
 	rootCmd.PersistentFlags().String("redis-host", "localhost", "Redis host")
 	rootCmd.PersistentFlags().Int("redis-port", 6379, "Redis port")
 	rootCmd.PersistentFlags().Int("redis-db", 0, "Redis database")
+	rootCmd.PersistentFlags().String("redis-password", "", "Redis password")
+	rootCmd.PersistentFlags().String("hostname", "", "Node hostname for multi-node Redis (auto-detected if not specified)")
 	rootCmd.PersistentFlags().Int("memory-threshold", types.MemoryThresholdMB, "Memory threshold in MB to consider a GPU as 'in use' (default: 1024)")
 
 	if err := viper.BindPFlag("redis.host", rootCmd.PersistentFlags().Lookup("redis-host")); err != nil {
@@ -45,6 +47,12 @@ func init() {
 	if err := viper.BindPFlag("redis.db", rootCmd.PersistentFlags().Lookup("redis-db")); err != nil {
 		panic(fmt.Sprintf("Failed to bind redis-db flag: %v", err))
 	}
+	if err := viper.BindPFlag("redis.password", rootCmd.PersistentFlags().Lookup("redis-password")); err != nil {
+		panic(fmt.Sprintf("Failed to bind redis-password flag: %v", err))
+	}
+	if err := viper.BindPFlag("hostname", rootCmd.PersistentFlags().Lookup("hostname")); err != nil {
+		panic(fmt.Sprintf("Failed to bind hostname flag: %v", err))
+	}
 	if err := viper.BindPFlag("memory.threshold", rootCmd.PersistentFlags().Lookup("memory-threshold")); err != nil {
 		panic(fmt.Sprintf("Failed to bind memory-threshold flag: %v", err))
 	}
@@ -53,6 +61,8 @@ func init() {
 	viper.SetDefault("redis.host", "localhost")
 	viper.SetDefault("redis.port", 6379)
 	viper.SetDefault("redis.db", 0)
+	viper.SetDefault("redis.password", "")
+	viper.SetDefault("hostname", "")
 	viper.SetDefault("memory.threshold", types.MemoryThresholdMB)
 }
 
@@ -88,6 +98,8 @@ func initConfig() {
 		RedisHost:       viper.GetString("redis.host"),
 		RedisPort:       viper.GetInt("redis.port"),
 		RedisDB:         viper.GetInt("redis.db"),
+		RedisPassword:   viper.GetString("redis.password"),
+		Hostname:        viper.GetString("hostname"),
 		MemoryThreshold: viper.GetInt("memory.threshold"),
 		RemoteHosts:     viper.GetStringSlice("remote_hosts"),
 	}

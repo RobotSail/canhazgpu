@@ -168,6 +168,8 @@ type Config struct {
 	RedisHost       string
 	RedisPort       int
 	RedisDB         int
+	RedisPassword   string   // Redis password for authentication
+	Hostname        string   // Node hostname for key namespacing (auto-detected if empty)
 	MemoryThreshold int
 	RemoteHosts     []string // SSH addresses (can use ~/.ssh/config entries for friendly names)
 }
@@ -178,10 +180,11 @@ const (
 	ReservationTypeManual = "manual"
 
 	RedisKeyPrefix         = "canhazgpu:"
-	RedisKeyGPUCount       = RedisKeyPrefix + "gpu_count"
-	RedisKeyProvider       = RedisKeyPrefix + "provider"
-	RedisKeyAllocationLock = RedisKeyPrefix + "allocation_lock"
-	RedisKeyUsageHistory   = RedisKeyPrefix + "usage_history:"
+	RedisKeyNodes          = RedisKeyPrefix + "nodes"          // Set of all registered nodes
+	RedisKeyGPUCount       = RedisKeyPrefix + "gpu_count"      // Legacy single-node key
+	RedisKeyProvider       = RedisKeyPrefix + "provider"       // Legacy single-node key
+	RedisKeyAllocationLock = RedisKeyPrefix + "allocation_lock" // Global allocation lock
+	RedisKeyUsageHistory   = RedisKeyPrefix + "usage_history_sorted" // Global usage history
 
 	HeartbeatInterval = 60 * time.Second
 	HeartbeatTimeout  = 5 * time.Minute
@@ -190,3 +193,23 @@ const (
 
 	MemoryThresholdMB = 1024
 )
+
+// NodeKey builds a node-specific Redis key with the format "canhazgpu:{hostname}:{suffix}"
+func NodeKey(hostname, suffix string) string {
+	return fmt.Sprintf("%s%s:%s", RedisKeyPrefix, hostname, suffix)
+}
+
+// NodeGPUCountKey returns the Redis key for a node's GPU count
+func NodeGPUCountKey(hostname string) string {
+	return NodeKey(hostname, "gpu_count")
+}
+
+// NodeProviderKey returns the Redis key for a node's GPU provider
+func NodeProviderKey(hostname string) string {
+	return NodeKey(hostname, "provider")
+}
+
+// NodeGPUKey returns the Redis key for a specific GPU on a node
+func NodeGPUKey(hostname string, gpuID int) string {
+	return fmt.Sprintf("%s%s:gpu:%d", RedisKeyPrefix, hostname, gpuID)
+}
